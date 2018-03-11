@@ -30,4 +30,4 @@ pkg
 #other
 *.pem
 main
-
+*settings*

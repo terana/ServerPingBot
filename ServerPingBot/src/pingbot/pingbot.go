@@ -12,20 +12,21 @@ import (
 	"strings"
 )
 
-var hostName = "78.140.221.64"
-var serverRespStr = "I'm OK"
-var delaySec time.Duration = 300
-
 type PingBot struct {
 	*tgbotapi.BotAPI
+	ServerURL           string
+	ServerResponse      string
+	HostAddress         string
 	Masters             []*tgbotapi.User
+	Delay               time.Duration
 	Chats               map[int64]*tgbotapi.Chat
 	IsControllingServer bool
 	IsControllingHost   bool
 	IsStarted           bool
 }
 
-func CreateBot(botToken string, masters []*tgbotapi.User) *PingBot {
+func CreateBot(botToken string, masters []*tgbotapi.User,
+	hostAddress string, serverResponse string, delay time.Duration, url string) *PingBot {
 	var err error
 	bot, err := tgbotapi.NewBotAPI(botToken)
 	if err != nil {
@@ -41,6 +42,10 @@ func CreateBot(botToken string, masters []*tgbotapi.User) *PingBot {
 	pingBot := PingBot{
 		BotAPI:              bot,
 		Masters:             masters,
+		HostAddress:         hostAddress,
+		ServerResponse:      serverResponse,
+		Delay:               delay,
+		ServerURL:           url,
 		IsControllingServer: false,
 		IsControllingHost:   false,
 		IsStarted:           false,
@@ -105,16 +110,13 @@ func (o *PingBot) ListenForUpdates() {
 				}
 			case "stop":
 				{
-					o.ReportToEverybody(fmt.Sprintf("%s (%s) ordered to stop controlling server",
-						msg.From.FirstName, msg.From.UserName))
+					o.AnswerStop(msg)
 					chMain <- 1
 					continue
 				}
 			case "die":
 				{
-					o.ReportToEverybody(fmt.Sprintf("%s (%s) killed me",
-						msg.From.FirstName, msg.From.UserName))
-					os.Exit(0)
+					o.AnswerDie(msg)
 				}
 			default:
 				o.AnswerUnexpected(msg)
@@ -123,6 +125,17 @@ func (o *PingBot) ListenForUpdates() {
 			o.AnswerSomething(msg)
 		}
 	}
+}
+
+func (o *PingBot) AnswerStop(msg *tgbotapi.Message) {
+	o.ReportToEverybody(fmt.Sprintf("%s (%s) ordered to stop controlling server",
+		msg.From.FirstName, msg.From.UserName))
+}
+
+func (o *PingBot) AnswerDie(msg *tgbotapi.Message) {
+	o.ReportToEverybody(fmt.Sprintf("%s (%s) killed me",
+		msg.From.FirstName, msg.From.UserName))
+	os.Exit(0)
 }
 
 func (o *PingBot) AnswerHello(msg *tgbotapi.Message) {
@@ -167,10 +180,11 @@ func (o *PingBot) StartDispatcher(chMain <-chan int, chHost chan int, chServer c
 		o.IsControllingHost = false
 		o.IsControllingServer = false
 	}()
+
 	for {
 		select {
 		case <-chMain:
-			log.Println("############ MAIN")
+			log.Println("Got cancel sinal from MAIN goroutine")
 			chHost <- 1
 			chServer <- 1
 			o.IsControllingServer = false
@@ -178,13 +192,14 @@ func (o *PingBot) StartDispatcher(chMain <-chan int, chHost chan int, chServer c
 			o.ReportToEverybody("Stopping controlling server and host...")
 
 		case <-chHost:
-			log.Println("############ HOST")
+			log.Println("Got cancel sinal from HOST goroutine")
 			o.IsControllingHost = false
+			o.ReportToEverybody("Stopping controlling host...")
 
 		case <-chServer:
-			log.Println("############ SERVER")
+			log.Println("Got cancel sinal from SERVER goroutine")
 			o.IsControllingServer = false
-
+			o.ReportToEverybody("Stopping controlling server...")
 		}
 	}
 }
@@ -192,35 +207,29 @@ func (o *PingBot) StartDispatcher(chMain <-chan int, chHost chan int, chServer c
 func (o *PingBot) ControlHost(ch chan int) {
 	defer func() {
 		if err := recover(); err != nil {
-
 			o.ReportToEverybody(fmt.Sprintf("Something went wrong with host!\n Got ERROR: %s", err))
 			ch <- 1
 			return
 		}
 	}()
-	err := o.PingHost(hostName, ch)
+
+	pinger := fastping.NewPinger()
+	pinger.MaxRTT = time.Second
+	ipAddr, err := net.ResolveIPAddr("ip4:icmp", o.HostAddress)
 	if err != nil {
 		panic(err)
 	}
-}
 
-func (o *PingBot) PingHost(hostName string, ch chan int) error {
-	pinger := fastping.NewPinger()
-	pinger.MaxRTT = time.Second
-	ipAddr, err := net.ResolveIPAddr("ip4:icmp", hostName)
-	if err != nil {
-		return err
-	}
 	pinger.AddIPAddr(ipAddr)
 	pinger.OnRecv = func(addr *net.IPAddr, rtt time.Duration) {
-		//log.Printf("IP Addr: %s receive, RTT: %v\n", addr.String(), rtt)
+		log.Printf("IP Addr: %s receive, RTT: %v\n", addr.String(), rtt)
 	}
 	firstTime := true
 	var msg int
-	for ; ; {
+	for {
 		err = pinger.Run()
 		if err != nil {
-			return err
+			panic(err)
 		}
 
 		if firstTime {
@@ -233,37 +242,30 @@ func (o *PingBot) PingHost(hostName string, ch chan int) error {
 			if msg != 0 {
 				log.Println("Stopped controlling host")
 				o.ReportToEverybody("Stopped controlling host")
-				return nil
+				return
 			}
 		default:
 		}
 
-		time.Sleep(delaySec * time.Second)
+		time.Sleep(o.Delay * time.Second)
 	}
 }
 
 func (o *PingBot) ControlServer(ch chan int) {
 	defer func() {
 		if err := recover(); err != nil {
-			o.ReportToEverybody(fmt.Sprintf("Something went wrong with Server!\n Got ERROR: %s", err))
+			o.ReportToEverybody(fmt.Sprintf("Something went wrong with Server!\nGot ERROR: %s", err))
 			ch <- 1
 			return
 		}
 	}()
-	err := o.PingServer(serverRespStr, ch)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func (o *PingBot) PingServer(respStr string, ch chan int) error {
 	req := fasthttp.AcquireRequest()
 	resp := fasthttp.AcquireResponse()
 	defer fasthttp.ReleaseRequest(req)
 	defer fasthttp.ReleaseResponse(resp)
 
 	req.Header.SetMethod("GET")
-	req.SetRequestURI("http://78.140.221.64:80/ping")
+	req.SetRequestURI(o.ServerURL)
 
 	client := fasthttp.Client{Name: "PingBot"}
 	firstTime := true
@@ -279,25 +281,28 @@ func (o *PingBot) PingServer(respStr string, ch chan int) error {
 			panic("Server is down")
 		}
 
-		if string(resp.Body()) != respStr {
+		if string(resp.Body()) != o.ServerResponse {
 			panic(fmt.Sprintf("Invalid responce: %s", resp.Body()))
 		}
+
 		if firstTime {
 			firstTime = false
 			o.ReportToEverybody("Server is working!")
 		}
+
+		log.Println("Server is working")
 
 		select {
 		case msg = <-ch:
 			if msg != 0 {
 				log.Println("Stopped controlling Server")
 				o.ReportToEverybody("Stopped controlling Server")
-				return nil
+				return
 			}
 		default:
 		}
 
-		time.Sleep(delaySec * time.Second)
+		time.Sleep(o.Delay * time.Second)
 	}
 }
 
